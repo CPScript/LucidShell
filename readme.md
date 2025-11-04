@@ -2,49 +2,10 @@
 
 ## Implementation Plan
 
-### Phase 1: Core Shell & Sandboxing [✔️]
-1. Rust REPL with command parser (clap-based)
-2. AppContainer + Job Objects wrapper for child processes
-3. Windows CNG integration for crypto primitives
-4. Ephemeral memory-mapped storage (PAGE_READWRITE | SEC_COMMIT with encryption)
+* **WFP Firewall** - Declare it but isn't implemented. The network "security" is just status tracking, not actual OS-level blocking.
+* **Sandbox Isolation** - Job Objects work, but is not enforcing filesystem/registry restrictions at the Windows API level.
+* **RFC 3161** - Currently sends HTTP requests but doesn't actually parse RFC 3161 ASN.1 responses. A real TSA would reject your requests when using this shell. It's a good *stub* though, and i plan on fixing such soon
+* **Container Encryption** - Verifys the container exists and has correct permissions, but doesn't actually decrypt or use it. *It's just a file check*.
+* **Plugin Execution** - Install/verify works, but no actual sandboxed execution or API.
 
-### Phase 2: Authorization & Legal Framework
-1. Rules of Engagement consent system with cryptographic signatures
-2. Evidence chain-of-custody metadata collection
-3. Engagement letter templates and audit trail storage
-
-### Phase 3: Network Controls & Anonymity
-1. WFP (Windows Filtering Platform) firewall integration per tool
-2. SOCKS5/Tor routing with kill-switch on anonymization failure
-3. WireGuard/OpenVPN management via system drivers
-
-### Phase 4: Tooling & Plugin System
-1. Sandboxed tool execution framework with capability declarations
-2. Plugin API with signature verification (Authenticode)
-3. Curated tool set: network scanners, forensic parsers, passive collectors
-
-### Phase 5: Forensics & Evidence Capture
-1. VSS-based read-only mounts and forensic copy APIs
-2. SHA-256/SHA-3 hashing with signed manifests
-3. Tamper-evident log chains (HMAC with append-only storage)
-
-### Phase 6: Hardware Integration & Updates
-1. FIDO2/YubiKey support for auth and container unlocking
-2. Signed update mechanism with reproducible build verification
-3. Panic wipe for emergency session termination
-
----
-
-## Cargo.toml Dependencies
-```
-[dependencies]
-clap = { version = "4.5", features = ["derive"] }
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-sha2 = "0.10"
-chrono = { version = "0.4", features = ["serde"] }
-uuid = { version = "1.10", features = ["v4", "serde"] }
-hex = "0.4"
-winapi = { version = "0.3", features = ["jobapi2", "winnt", "securitybaseapi"] }
-ring = "0.17"  # For cryptographic operations
-```
+All of these will be fixed/completed soon.
