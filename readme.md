@@ -32,3 +32,19 @@
 1. FIDO2/YubiKey support for auth and container unlocking
 2. Signed update mechanism with reproducible build verification
 3. Panic wipe for emergency session termination
+
+---
+
+## Cargo.toml Dependencies
+```
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1.10", features = ["v4", "serde"] }
+hex = "0.4"
+winapi = { version = "0.3", features = ["jobapi2", "winnt", "securitybaseapi"] }
+ring = "0.17"  # For cryptographic operations
+```
