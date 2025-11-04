@@ -1,10 +1,10 @@
 [package]
 name = "lucidshell"
-version = "0.1.0"
-edition = "2025"
+version = "0.1.4"
+edition = "2021"
 authors = ["CPScript"]
 description = "White-Hat Security Shell with Sandboxing & Authorization"
-license = "GPL-3.0"
+license = " GPL-3.0"
 
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
@@ -14,6 +14,7 @@ sha2 = "0.10"
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1.10", features = ["v4", "serde"] }
 hex = "0.4"
+reqwest = { version = "0.11", features = ["blocking"] }
 
 [target.'cfg(windows)'.dependencies]
 winapi = { version = "0.3", features = [
@@ -24,6 +25,8 @@ winapi = { version = "0.3", features = [
     "securitybaseapi",
     "tlhelp32",
     "synchapi",
+    "aclapi",
+    "winbase",
 ] }
 
 [profile.release]
