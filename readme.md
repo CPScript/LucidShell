@@ -2,7 +2,7 @@
 
 ## Implementation Plan
 
-### Phase 1: Core Shell & Sandboxing
+### Phase 1: Core Shell & Sandboxing [✔️]
 1. Rust REPL with command parser (clap-based)
 2. AppContainer + Job Objects wrapper for child processes
 3. Windows CNG integration for crypto primitives
