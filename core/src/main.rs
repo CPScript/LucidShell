@@ -740,7 +740,7 @@ impl SandboxManager {
         
         let mut cmd = Command::new(&tool_path);
         cmd.args(args);
-        cmd.stdin(Stdio::null());
+        cmd.stdin(Stdio::inherit());
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
         
@@ -805,11 +805,23 @@ impl SandboxManager {
             }
         }
         
-        if let Some(stdout) = child.stdout.take() {
+        let stdout_handle = child.stdout.take();
+        let stderr_handle = child.stderr.take();
+        
+        if let Some(stdout) = stdout_handle {
             let reader = BufReader::new(stdout);
             for line in reader.lines() {
                 if let Ok(line) = line {
-                    println!("  [Output] {}", line);
+                    println!("{}", line);
+                }
+            }
+        }
+        
+        if let Some(stderr) = stderr_handle {
+            let reader = BufReader::new(stderr);
+            for line in reader.lines() {
+                if let Ok(line) = line {
+                    eprintln!("{}", line);
                 }
             }
         }
@@ -1341,8 +1353,14 @@ impl PluginManager {
             },
         };
         
+        let plugin_path = plugin.path.to_str()
+            .ok_or("Invalid plugin path")?
+            .to_string();
+        
+        println!("  [Plugin] Executing: {} with args: {:?}", plugin_path, args);
+        
         sandbox.execute_sandboxed(
-            plugin.path.to_str().unwrap(),
+            &plugin_path,
             args,
             sandbox_config,
         )?;
@@ -3019,7 +3037,7 @@ impl LucidShell {
     }
     
     fn panic_wipe(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        println!("\nPANIC WIPE INITIATED");
+        println!("\n⚠ PANIC WIPE INITIATED");
         
         let mut logger = self.log_writer.lock().unwrap();
         let _ = logger.log_event("PANIC_WIPE", "emergency_termination", &self.crypto_engine);
