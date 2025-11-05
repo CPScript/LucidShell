@@ -2,7 +2,6 @@
 // Provides access to git, python, cargo, and other dev tools with controlled network permissions
 // NO EXTERNAL DEPENDENCIES - Pure Rust stdlib only
 
-// Currently in development. I still need to make it where the shell properly runs and configures itself for plugins.
 // Was wanting to take a break form coding for a bit, so i made this during my break. <3
 
 use std::env;
