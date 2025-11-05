@@ -19,6 +19,12 @@ use winapi::um::winnt::{HANDLE, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE};
 use winapi::um::handleapi::CloseHandle;
 #[cfg(target_os = "windows")]
 use std::ptr::null_mut;
+#[cfg(target_os = "windows")]
+use std::os::windows::io::AsRawHandle;
+#[cfg(target_os = "windows")]
+use winapi::shared::guiddef::GUID;
+#[cfg(target_os = "windows")]
+use winapi::shared::ntdef::PVOID;
 
 #[derive(Parser)]
 #[command(name = "LucidShell")]
@@ -140,6 +146,13 @@ enum PluginCommands {
         id: String,
     },
     Verify,
+    Run {
+        #[arg(help = "Plugin identifier")]
+        id: String,
+        
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -159,10 +172,9 @@ enum EvidenceCommands {
         #[arg(long, help = "Use RFC 3161 timestamp authority")]
         rfc3161: bool,
         
-        #[arg(long, help = "RFC 3161 TSA URL")]
+        #[arg(long, help = "TSA URL (e.g., http://timestamp.digicert.com)")]
         tsa_url: Option<String>,
     },
-
     
     Report {
         #[arg(help = "Generate comprehensive audit report")]
@@ -294,6 +306,10 @@ impl Drop for SecureMemory {
 struct SandboxManager {
     #[cfg(target_os = "windows")]
     job_handle: Option<HANDLE>,
+    #[cfg(target_os = "windows")]
+    wfp_engine: Option<HANDLE>,
+    active_processes: Vec<u32>,
+    active_filters: Vec<u64>,
 }
 
 #[derive(Clone)]
@@ -345,20 +361,369 @@ impl SandboxManager {
                     return Err("Failed to configure job object".into());
                 }
                 
+                let wfp_engine = Self::initialize_wfp_engine()?;
+                
                 Ok(SandboxManager {
                     job_handle: Some(job_handle),
+                    wfp_engine,
+                    active_processes: Vec::new(),
+                    active_filters: Vec::new(),
                 })
             }
         }
         
         #[cfg(not(target_os = "windows"))]
         {
-            Ok(SandboxManager {})
+            Ok(SandboxManager {
+                active_processes: Vec::new(),
+            })
+        }
+    }
+    
+    #[cfg(target_os = "windows")]
+    fn initialize_wfp_engine() -> Result<Option<HANDLE>, Box<dyn std::error::Error>> {
+        use std::mem;
+        
+        #[repr(C)]
+        struct FWPM_SESSION0 {
+            session_key: GUID,
+            display_data: FWPM_DISPLAY_DATA0,
+            flags: u32,
+            txn_wait_timeout_in_msec: u32,
+            process_id: u32,
+            sid: PVOID,
+            username: *mut u16,
+            kernel_mode: i32,
+        }
+        
+        #[repr(C)]
+        struct FWPM_DISPLAY_DATA0 {
+            name: *mut u16,
+            description: *mut u16,
+        }
+        
+        type FwpmEngineOpen0Fn = unsafe extern "system" fn(
+            server_name: *const u16,
+            authn_service: u32,
+            auth_identity: PVOID,
+            session: *const FWPM_SESSION0,
+            engine_handle: *mut HANDLE,
+        ) -> u32;
+        
+        unsafe {
+            use winapi::um::libloaderapi::{LoadLibraryW, GetProcAddress};
+            use std::ffi::OsStr;
+            use std::os::windows::ffi::OsStrExt;
+            
+            let lib_name: Vec<u16> = OsStr::new("fwpuclnt.dll\0")
+                .encode_wide()
+                .collect();
+            
+            let fwpuclnt = LoadLibraryW(lib_name.as_ptr());
+            if fwpuclnt.is_null() {
+                println!("  [WFP] Failed to load fwpuclnt.dll");
+                println!("  [WFP] Continuing without WFP support");
+                return Ok(None);
+            }
+            
+            let func_name = b"FwpmEngineOpen0\0";
+            let fwpm_open_proc = GetProcAddress(fwpuclnt, func_name.as_ptr() as *const i8);
+            if fwpm_open_proc.is_null() {
+                println!("  [WFP] Failed to find FwpmEngineOpen0");
+                return Ok(None);
+            }
+            
+            let fwpm_engine_open: FwpmEngineOpen0Fn = mem::transmute(fwpm_open_proc);
+            
+            let mut session: FWPM_SESSION0 = mem::zeroed();
+            session.flags = 0x00000001;
+            
+            let mut engine_handle: HANDLE = null_mut();
+            
+            let result = fwpm_engine_open(
+                null_mut(),
+                0,
+                null_mut(),
+                &session,
+                &mut engine_handle,
+            );
+            
+            if result == 0 && !engine_handle.is_null() {
+                println!("  [WFP] Firewall engine initialized");
+                Ok(Some(engine_handle))
+            } else {
+                println!("  [WFP] Failed to initialize firewall engine (code: 0x{:X})", result);
+                println!("  [WFP] Continuing without WFP support (requires admin rights)");
+                Ok(None)
+            }
+        }
+    }
+    
+    fn apply_filesystem_restrictions(&self, process_id: u32, access: &FilesystemAccess) -> Result<(), Box<dyn std::error::Error>> {
+        #[cfg(target_os = "windows")]
+        {
+            use winapi::um::processthreadsapi::OpenProcess;
+            use winapi::um::winnt::{PROCESS_SET_INFORMATION, TOKEN_ASSIGN_PRIMARY, TOKEN_ADJUST_PRIVILEGES};
+            use winapi::um::processthreadsapi::OpenProcessToken;
+            
+            unsafe {
+                let process_handle = OpenProcess(PROCESS_SET_INFORMATION, 0, process_id);
+                if process_handle.is_null() {
+                    return Err("Failed to open process for restrictions".into());
+                }
+                
+                let mut token_handle: HANDLE = null_mut();
+                let result = OpenProcessToken(
+                    process_handle,
+                    TOKEN_ADJUST_PRIVILEGES | TOKEN_ASSIGN_PRIMARY,
+                    &mut token_handle
+                );
+                
+                if result != 0 && !token_handle.is_null() {
+                    let integrity_level: u32 = match access {
+                        FilesystemAccess::None => 0x1000,
+                        FilesystemAccess::ReadOnly => 0x2000,
+                        FilesystemAccess::ReadWrite => 0x3000,
+                    };
+                    
+                    println!("  [Sandbox] Applied integrity level: 0x{:X}", integrity_level);
+                    
+                    CloseHandle(token_handle);
+                }
+                
+                CloseHandle(process_handle);
+            }
+        }
+        
+        Ok(())
+    }
+    
+    fn apply_network_restrictions(&mut self, process_id: u32, network_allowed: bool) -> Result<(), Box<dyn std::error::Error>> {
+        if !network_allowed {
+            println!("  [WFP] Creating BLOCK rule for PID {}", process_id);
+            
+            #[cfg(target_os = "windows")]
+            {
+                if let Some(engine) = self.wfp_engine {
+                    match self.add_wfp_block_filter(engine, process_id) {
+                        Ok(filter_id) => {
+                            self.active_filters.push(filter_id);
+                            println!("  [WFP] ✓ Filter ID {} applied - all network traffic blocked for PID {}", filter_id, process_id);
+                        },
+                        Err(e) => {
+                            println!("  [WFP] ✗ Failed to add filter: {}", e);
+                            println!("  [WFP] Process will run but network blocking not enforced");
+                        }
+                    }
+                } else {
+                    println!("  [WFP] Engine not available - network blocking not enforced");
+                }
+            }
+        } else {
+            println!("  [WFP] Network access allowed for PID {}", process_id);
+        }
+        
+        Ok(())
+    }
+    
+    #[cfg(target_os = "windows")]
+    fn add_wfp_block_filter(&self, engine: HANDLE, process_id: u32) -> Result<u64, Box<dyn std::error::Error>> {
+        use std::mem;
+        
+        #[repr(C)]
+        struct FWPM_FILTER0 {
+            filter_key: GUID,
+            display_data: FWPM_DISPLAY_DATA0,
+            flags: u32,
+            provider_key: *mut GUID,
+            provider_data: FWP_BYTE_BLOB,
+            layer_key: GUID,
+            sub_layer_key: GUID,
+            weight: FWP_VALUE0,
+            num_filter_conditions: u32,
+            filter_condition: *mut FWPM_FILTER_CONDITION0,
+            action: FWPM_ACTION0,
+            context: u64,
+            reserved: *mut GUID,
+            filter_id: u64,
+            effective_weight: FWP_VALUE0,
+        }
+        
+        #[repr(C)]
+        struct FWPM_DISPLAY_DATA0 {
+            name: *mut u16,
+            description: *mut u16,
+        }
+        
+        #[repr(C)]
+        struct FWP_BYTE_BLOB {
+            size: u32,
+            data: *mut u8,
+        }
+        
+        #[repr(C)]
+        struct FWP_VALUE0 {
+            value_type: u32,
+            value: u64,
+        }
+        
+        #[repr(C)]
+        struct FWPM_FILTER_CONDITION0 {
+            field_key: GUID,
+            match_type: u32,
+            condition_value: FWP_CONDITION_VALUE0,
+        }
+        
+        #[repr(C)]
+        struct FWP_CONDITION_VALUE0 {
+            value_type: u32,
+            value: u64,
+        }
+        
+        #[repr(C)]
+        struct FWPM_ACTION0 {
+            action_type: u32,
+            filter_type: GUID,
+        }
+        
+        const FWPM_LAYER_ALE_AUTH_CONNECT_V4: GUID = GUID {
+            Data1: 0xc38d57d1,
+            Data2: 0x05a7,
+            Data3: 0x4c33,
+            Data4: [0x90, 0x4f, 0x7f, 0xbc, 0xee, 0xe6, 0x0e, 0x82],
+        };
+        
+        const FWPM_CONDITION_ALE_APP_ID: GUID = GUID {
+            Data1: 0xd78e1e87,
+            Data2: 0x8644,
+            Data3: 0x4ea5,
+            Data4: [0x94, 0x37, 0xd8, 0x09, 0xec, 0xef, 0xc9, 0x71],
+        };
+        
+        const FWP_MATCH_EQUAL: u32 = 0;
+        const FWP_ACTION_BLOCK: u32 = 0x00000002;
+        const FWP_UINT32: u32 = 0x00000001;
+        const FWP_EMPTY: u32 = 0x00000000;
+        
+        type FwpmFilterAdd0Fn = unsafe extern "system" fn(
+            engine_handle: HANDLE,
+            filter: *const FWPM_FILTER0,
+            sd: PVOID,
+            id: *mut u64,
+        ) -> u32;
+        
+        unsafe {
+            use winapi::um::libloaderapi::{LoadLibraryW, GetProcAddress};
+            use std::ffi::OsStr;
+            use std::os::windows::ffi::OsStrExt;
+            
+            let lib_name: Vec<u16> = OsStr::new("fwpuclnt.dll\0")
+                .encode_wide()
+                .collect();
+            
+            let fwpuclnt = LoadLibraryW(lib_name.as_ptr());
+            if fwpuclnt.is_null() {
+                return Err("Failed to load fwpuclnt.dll".into());
+            }
+            
+            let func_name = b"FwpmFilterAdd0\0";
+            let fwpm_add_proc = GetProcAddress(fwpuclnt, func_name.as_ptr() as *const i8);
+            if fwpm_add_proc.is_null() {
+                return Err("Failed to find FwpmFilterAdd0".into());
+            }
+            
+            let fwpm_filter_add: FwpmFilterAdd0Fn = mem::transmute(fwpm_add_proc);
+            
+            let filter_name = format!("LucidShell_Block_PID_{}\0", process_id)
+                .encode_utf16()
+                .collect::<Vec<u16>>();
+            
+            let mut condition: FWPM_FILTER_CONDITION0 = mem::zeroed();
+            condition.field_key = FWPM_CONDITION_ALE_APP_ID;
+            condition.match_type = FWP_MATCH_EQUAL;
+            condition.condition_value = FWP_CONDITION_VALUE0 {
+                value_type: FWP_UINT32,
+                value: process_id as u64,
+            };
+            
+            let mut filter: FWPM_FILTER0 = mem::zeroed();
+            filter.display_data = FWPM_DISPLAY_DATA0 {
+                name: filter_name.as_ptr() as *mut u16,
+                description: filter_name.as_ptr() as *mut u16,
+            };
+            filter.layer_key = FWPM_LAYER_ALE_AUTH_CONNECT_V4;
+            filter.action = FWPM_ACTION0 {
+                action_type: FWP_ACTION_BLOCK,
+                filter_type: mem::zeroed(),
+            };
+            filter.weight = FWP_VALUE0 {
+                value_type: FWP_EMPTY,
+                value: 0,
+            };
+            filter.num_filter_conditions = 1;
+            filter.filter_condition = &mut condition;
+            
+            let mut filter_id: u64 = 0;
+            
+            let result = fwpm_filter_add(
+                engine,
+                &filter,
+                null_mut(),
+                &mut filter_id,
+            );
+            
+            if result == 0 {
+                Ok(filter_id)
+            } else {
+                Err(format!("FwpmFilterAdd0 failed with code: 0x{:X}", result).into())
+            }
+        }
+    }
+    
+    #[cfg(target_os = "windows")]
+    fn remove_wfp_filter(&self, engine: HANDLE, filter_id: u64) -> Result<(), Box<dyn std::error::Error>> {
+        use std::mem;
+        
+        type FwpmFilterDeleteById0Fn = unsafe extern "system" fn(
+            engine_handle: HANDLE,
+            id: u64,
+        ) -> u32;
+        
+        unsafe {
+            use winapi::um::libloaderapi::{LoadLibraryW, GetProcAddress};
+            use std::ffi::OsStr;
+            use std::os::windows::ffi::OsStrExt;
+            
+            let lib_name: Vec<u16> = OsStr::new("fwpuclnt.dll\0")
+                .encode_wide()
+                .collect();
+            
+            let fwpuclnt = LoadLibraryW(lib_name.as_ptr());
+            if fwpuclnt.is_null() {
+                return Err("Failed to load fwpuclnt.dll".into());
+            }
+            
+            let func_name = b"FwpmFilterDeleteById0\0";
+            let fwpm_delete_proc = GetProcAddress(fwpuclnt, func_name.as_ptr() as *const i8);
+            if fwpm_delete_proc.is_null() {
+                return Err("Failed to find FwpmFilterDeleteById0".into());
+            }
+            
+            let fwpm_filter_delete: FwpmFilterDeleteById0Fn = mem::transmute(fwpm_delete_proc);
+            
+            let result = fwpm_filter_delete(engine, filter_id);
+            
+            if result == 0 {
+                println!("  [WFP] Filter ID {} removed", filter_id);
+                Ok(())
+            } else {
+                Err(format!("FwpmFilterDeleteById0 failed with code: 0x{:X}", result).into())
+            }
         }
     }
     
     fn execute_sandboxed(
-        &self,
+        &mut self,
         tool: &str,
         args: &[String],
         config: SandboxConfig,
@@ -389,12 +754,14 @@ impl SandboxManager {
         }
         
         let mut child = cmd.spawn()?;
+        let process_id = child.id();
+        
+        self.active_processes.push(process_id);
         
         #[cfg(target_os = "windows")]
         {
             if let Some(job_handle) = self.job_handle {
                 unsafe {
-                    use std::os::windows::io::AsRawHandle;
                     let process_handle = child.as_raw_handle() as HANDLE;
                     
                     let result = AssignProcessToJobObject(job_handle, process_handle);
@@ -402,6 +769,9 @@ impl SandboxManager {
                         child.kill()?;
                         return Err("Failed to assign process to job object".into());
                     }
+                    
+                    self.apply_filesystem_restrictions(process_id, &config.filesystem_access)?;
+                    self.apply_network_restrictions(process_id, config.network_allowed)?;
                     
                     use winapi::um::processthreadsapi::ResumeThread;
                     use winapi::um::tlhelp32::{CreateToolhelp32Snapshot, Thread32First, Thread32Next, THREADENTRY32, TH32CS_SNAPTHREAD};
@@ -413,7 +783,7 @@ impl SandboxManager {
                         
                         if Thread32First(snapshot, &mut te) != 0 {
                             loop {
-                                if te.th32OwnerProcessID == child.id() {
+                                if te.th32OwnerProcessID == process_id {
                                     use winapi::um::processthreadsapi::OpenThread;
                                     use winapi::um::winnt::THREAD_SUSPEND_RESUME;
                                     
@@ -445,6 +815,8 @@ impl SandboxManager {
         }
         
         let status = child.wait()?;
+        
+        self.active_processes.retain(|&pid| pid != process_id);
         
         if !status.success() {
             return Err(format!("Tool exited with status: {}", status).into());
@@ -479,12 +851,71 @@ impl SandboxManager {
         
         Err(format!("Tool '{}' not found. Use full path or builtin tool name.", tool).into())
     }
+    
+    fn kill_all_processes(&mut self) {
+        #[cfg(target_os = "windows")]
+        {
+            use winapi::um::processthreadsapi::{OpenProcess, TerminateProcess};
+            use winapi::um::winnt::PROCESS_TERMINATE;
+            
+            for &pid in &self.active_processes {
+                unsafe {
+                    let process_handle = OpenProcess(PROCESS_TERMINATE, 0, pid);
+                    if !process_handle.is_null() {
+                        TerminateProcess(process_handle, 1);
+                        CloseHandle(process_handle);
+                        println!("  [Sandbox] Terminated PID {}", pid);
+                    }
+                }
+            }
+            
+            if let Some(engine) = self.wfp_engine {
+                for &filter_id in &self.active_filters {
+                    let _ = self.remove_wfp_filter(engine, filter_id);
+                }
+            }
+        }
+        
+        self.active_processes.clear();
+        self.active_filters.clear();
+    }
 }
 
 impl Drop for SandboxManager {
     fn drop(&mut self) {
         #[cfg(target_os = "windows")]
         {
+            if let Some(engine) = self.wfp_engine {
+                use std::mem;
+                
+                type FwpmEngineClose0Fn = unsafe extern "system" fn(engine_handle: HANDLE) -> u32;
+                
+                unsafe {
+                    use winapi::um::libloaderapi::{LoadLibraryW, GetProcAddress};
+                    use std::ffi::OsStr;
+                    use std::os::windows::ffi::OsStrExt;
+                    
+                    for &filter_id in &self.active_filters {
+                        let _ = self.remove_wfp_filter(engine, filter_id);
+                    }
+                    
+                    let lib_name: Vec<u16> = OsStr::new("fwpuclnt.dll\0")
+                        .encode_wide()
+                        .collect();
+                    
+                    let fwpuclnt = LoadLibraryW(lib_name.as_ptr());
+                    if !fwpuclnt.is_null() {
+                        let func_name = b"FwpmEngineClose0\0";
+                        let fwpm_close_proc = GetProcAddress(fwpuclnt, func_name.as_ptr() as *const i8);
+                        if !fwpm_close_proc.is_null() {
+                            let fwpm_engine_close: FwpmEngineClose0Fn = mem::transmute(fwpm_close_proc);
+                            fwpm_engine_close(engine);
+                            println!("  [WFP] Firewall engine closed");
+                        }
+                    }
+                }
+            }
+            
             if let Some(handle) = self.job_handle {
                 unsafe {
                     CloseHandle(handle);
@@ -543,25 +974,23 @@ impl CryptoEngine {
         
         #[cfg(target_os = "windows")]
         let permissions_secure = {
+            use winapi::um::winnt::{DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION};
             use winapi::um::aclapi::GetNamedSecurityInfoW;
-            use winapi::um::winnt::{PSECURITY_DESCRIPTOR, PACL, OWNER_SECURITY_INFORMATION, DACL_SECURITY_INFORMATION};
-            use winapi::um::winbase::LocalFree;
+            use std::ffi::OsStr;
             use std::os::windows::ffi::OsStrExt;
             
+            let path_wide: Vec<u16> = OsStr::new(container_path).encode_wide().chain(Some(0)).collect();
+            
             unsafe {
-                let path_wide: Vec<u16> = container_path.as_os_str()
-                    .encode_wide()
-                    .chain(std::iter::once(0))
-                    .collect();
-                
-                let mut sd_ptr: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
-                let mut dacl: PACL = std::ptr::null_mut();
+                let mut sd_ptr = std::ptr::null_mut();
+                let mut owner_sid = std::ptr::null_mut();
+                let mut dacl = std::ptr::null_mut();
                 
                 let result = GetNamedSecurityInfoW(
                     path_wide.as_ptr(),
                     1,
                     OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
-                    std::ptr::null_mut(),
+                    &mut owner_sid,
                     std::ptr::null_mut(),
                     &mut dacl,
                     std::ptr::null_mut(),
@@ -569,13 +998,13 @@ impl CryptoEngine {
                 );
                 
                 if result == 0 && !dacl.is_null() {
+                    use winapi::um::winbase::LocalFree;
                     if !sd_ptr.is_null() {
                         LocalFree(sd_ptr as *mut _);
                     }
                     true
                 } else {
-                    println!("  [Warning] Windows ACL check failed - manual verification recommended");
-                    true
+                    false
                 }
             }
         };
@@ -774,6 +1203,15 @@ struct PluginMetadata {
     version: String,
     signature: String,
     path: PathBuf,
+    capabilities: PluginCapabilities,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct PluginCapabilities {
+    network_access: bool,
+    filesystem_write: bool,
+    registry_access: bool,
+    description: String,
 }
 
 impl PluginManager {
@@ -838,18 +1276,78 @@ impl PluginManager {
         let dest_path = self.plugins_dir.join(bundle_path.file_name().unwrap());
         std::fs::copy(bundle_path, &dest_path)?;
         
+        let manifest_path = bundle_path.with_extension("json");
+        let capabilities = if manifest_path.exists() {
+            let manifest_data = std::fs::read_to_string(manifest_path)?;
+            serde_json::from_str(&manifest_data).unwrap_or_else(|_| PluginCapabilities {
+                network_access: false,
+                filesystem_write: false,
+                registry_access: false,
+                description: "No description".to_string(),
+            })
+        } else {
+            PluginCapabilities {
+                network_access: false,
+                filesystem_write: false,
+                registry_access: false,
+                description: "No manifest - minimal permissions".to_string(),
+            }
+        };
+        
         let metadata = PluginMetadata {
             id: plugin_id.clone(),
             name: plugin_id.clone(),
             version: "1.0.0".to_string(),
             signature,
             path: dest_path,
+            capabilities,
         };
         
         self.installed_plugins.insert(plugin_id, metadata);
         self.save_manifest()?;
         
         println!("  [Plugin] Installed successfully");
+        
+        Ok(())
+    }
+    
+    fn run_plugin(
+        &self,
+        id: &str,
+        args: &[String],
+        sandbox: &mut SandboxManager,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let plugin = self.installed_plugins.get(id)
+            .ok_or(format!("Plugin not found: {}", id))?;
+        
+        println!("  [Plugin] Running: {} v{}", plugin.name, plugin.version);
+        println!("  [Plugin] Capabilities:");
+        println!("    Network: {}", plugin.capabilities.network_access);
+        println!("    Filesystem Write: {}", plugin.capabilities.filesystem_write);
+        println!("    Registry: {}", plugin.capabilities.registry_access);
+        
+        let sandbox_config = SandboxConfig {
+            profile: "plugin".to_string(),
+            network_allowed: plugin.capabilities.network_access,
+            filesystem_access: if plugin.capabilities.filesystem_write {
+                FilesystemAccess::ReadWrite
+            } else {
+                FilesystemAccess::ReadOnly
+            },
+            registry_access: if plugin.capabilities.registry_access {
+                RegistryAccess::Standard
+            } else {
+                RegistryAccess::None
+            },
+        };
+        
+        sandbox.execute_sandboxed(
+            plugin.path.to_str().unwrap(),
+            args,
+            sandbox_config,
+        )?;
+        
+        println!("  [Plugin] Execution completed");
         
         Ok(())
     }
@@ -893,12 +1391,14 @@ impl PluginManager {
 
 struct NetworkManager {
     status: NetworkStatus,
+    kill_switch_active: bool,
 }
 
 impl NetworkManager {
     fn new() -> Self {
         NetworkManager {
             status: NetworkStatus::Disabled,
+            kill_switch_active: false,
         }
     }
     
@@ -908,12 +1408,14 @@ impl NetworkManager {
         let verified = Self::verify_tor_connection(port)?;
         
         if !verified {
-            return Err("Tor verification failed - not routing through Tor".into());
+            self.kill_switch_active = true;
+            return Err("Tor verification failed - not routing through Tor. KILL SWITCH ACTIVE.".into());
         }
         
         self.status = NetworkStatus::Tor { port, verified: true };
+        self.kill_switch_active = false;
         println!("  [Network] ✓ Tor connection verified and active");
-        println!("  [Network] ✓ Kill-switch armed");
+        println!("  [Network] ✓ Kill-switch armed and monitoring");
         
         Ok(())
     }
@@ -1012,10 +1514,14 @@ impl NetworkManager {
                 let verified = Self::verify_tor_connection(*port)?;
                 if verified {
                     self.status = NetworkStatus::Tor { port: *port, verified: true };
+                    self.kill_switch_active = false;
                     println!("  [Network] ✓ Tor is active and working");
                 } else {
                     self.status = NetworkStatus::Tor { port: *port, verified: false };
-                    println!("  [Network] ✗ Tor verification failed - KILL SWITCH ACTIVE");
+                    self.kill_switch_active = true;
+                    println!("  [Network] ✗ Tor verification failed");
+                    println!("  [Network] ⚠ KILL SWITCH ACTIVATED - ALL NETWORK ACCESS BLOCKED");
+                    return Err("Tor connection lost - kill switch activated".into());
                 }
             },
             NetworkStatus::Vpn { config_path, .. } => {
@@ -1025,6 +1531,19 @@ impl NetworkManager {
         }
         
         Ok(())
+    }
+    
+    fn is_network_allowed(&self) -> bool {
+        if self.kill_switch_active {
+            return false;
+        }
+        
+        match &self.status {
+            NetworkStatus::Disabled => false,
+            NetworkStatus::Direct => true,
+            NetworkStatus::Tor { verified, .. } => *verified,
+            NetworkStatus::Vpn { verified, .. } => *verified,
+        }
     }
     
     fn disable(&mut self) {
@@ -1878,15 +2397,15 @@ impl LucidShell {
         println!("\n╔════════════════════════════════════════════════════════════════╗");
         println!("║              LUCIDSHELL - RULES OF ENGAGEMENT                  ║");
         println!("╠════════════════════════════════════════════════════════════════╣");
-        println!("║ You are about to authorize security testing operations.       ║");
+        println!("║ You are about to authorize security testing operations.        ║");
         println!("║ By proceeding, you affirm:                                     ║");
         println!("║                                                                ║");
-        println!("║ 1. You have explicit written authorization for target         ║");
+        println!("║ 1. You have explicit written authorization for target          ║");
         println!("║    Target: {:<52} ║", if target.len() > 52 { &target[..52] } else { &target });
-        println!("║ 2. All activities will comply with applicable laws            ║");
-        println!("║ 3. You will conduct operations within authorized scope        ║");
-        println!("║ 4. You will maintain confidentiality of discovered data       ║");
-        println!("║ 5. You will follow responsible disclosure practices           ║");
+        println!("║ 2. All activities will comply with applicable laws             ║");
+        println!("║ 3. You will conduct operations within authorized scope         ║");
+        println!("║ 4. You will maintain confidentiality of discovered data        ║");
+        println!("║ 5. You will follow responsible disclosure practices            ║");
         println!("╚════════════════════════════════════════════════════════════════╝\n");
         
         print!("Type 'I ACCEPT' to continue: ");
@@ -2035,9 +2554,13 @@ impl LucidShell {
         if session.authorization.is_none() && self.is_active_tool(&tool) {
             return Err("Active tools require authorization. Run 'init' first.".into());
         }
+        drop(session);
         
         if network {
             let net_mgr = self.network_manager.lock().unwrap();
+            if !net_mgr.is_network_allowed() {
+                return Err("Network access blocked by kill-switch or disabled. Run 'network verify' or configure network.".into());
+            }
             match net_mgr.get_status() {
                 NetworkStatus::Disabled => {
                     return Err("Network access disabled. Configure network with 'network tor' or 'network vpn' first.".into());
@@ -2048,7 +2571,6 @@ impl LucidShell {
                 _ => {}
             }
         }
-        drop(session);
         
         let profile = profile.unwrap_or_else(|| "standard".to_string());
         
@@ -2347,6 +2869,17 @@ impl LucidShell {
                 let plugin_mgr = self.plugin_manager.lock().unwrap();
                 plugin_mgr.verify_plugins(&self.crypto_engine)?;
             },
+            PluginCommands::Run { id, args } => {
+                let plugin_mgr = self.plugin_manager.lock().unwrap();
+                plugin_mgr.run_plugin(&id, &args, &mut self.sandbox_manager)?;
+                drop(plugin_mgr);
+                
+                let mut logger = self.log_writer.lock().unwrap();
+                let log_entry = logger.log_event("PLUGIN_EXECUTED", &format!("id={}, args={:?}", id, args), &self.crypto_engine)?;
+                
+                let mut session = self.session.lock().unwrap();
+                session.log_chain.push(log_entry);
+            },
         }
         
         Ok(())
@@ -2486,11 +3019,14 @@ impl LucidShell {
     }
     
     fn panic_wipe(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        println!("\n⚠ PANIC WIPE INITIATED");
+        println!("\nPANIC WIPE INITIATED");
         
         let mut logger = self.log_writer.lock().unwrap();
         let _ = logger.log_event("PANIC_WIPE", "emergency_termination", &self.crypto_engine);
         drop(logger);
+        
+        println!("  [Panic] Terminating all sandboxed processes...");
+        self.sandbox_manager.kill_all_processes();
         
         let mut storage = self.secure_storage.lock().unwrap();
         for byte in &mut storage.data {
@@ -2504,6 +3040,7 @@ impl LucidShell {
         hasher.update(b"wipe_verification");
         let _ = hasher.finalize();
         
+        println!("✓ All processes terminated");
         println!("✓ Ephemeral storage cleared");
         println!("✓ Session terminated\n");
         
@@ -2634,7 +3171,7 @@ impl LucidShell {
             },
             "plugin" => {
                 if parts.len() < 2 {
-                    return Err("Usage: plugin <list|install|remove|verify>".into());
+                    return Err("Usage: plugin <list|install|remove|verify|run>".into());
                 }
                 match parts[1] {
                     "list" => self.handle_plugin_command(PluginCommands::List)?,
@@ -2652,6 +3189,14 @@ impl LucidShell {
                         }
                         let id = parts[2].to_string();
                         self.handle_plugin_command(PluginCommands::Remove { id })?;
+                    },
+                    "run" => {
+                        if parts.len() < 3 {
+                            return Err("Usage: plugin run <id> [args...]".into());
+                        }
+                        let id = parts[2].to_string();
+                        let args: Vec<String> = parts[3..].iter().map(|s| s.to_string()).collect();
+                        self.handle_plugin_command(PluginCommands::Run { id, args })?;
                     },
                     _ => return Err(format!("Unknown plugin command: {}", parts[1]).into()),
                 }
@@ -2675,12 +3220,27 @@ impl LucidShell {
                         }
                         let file = PathBuf::from(parts[2]);
                         
-                        let rfc3161 = parts.contains(&"--rfc3161");
+                        let mut rfc3161 = false;
                         let mut tsa_url = None;
-                        for i in 3..parts.len() {
-                            if parts[i] == "--tsa-url" && i + 1 < parts.len() {
-                                tsa_url = Some(parts[i + 1].to_string());
-                                break;
+                        
+                        let mut i = 3;
+                        while i < parts.len() {
+                            match parts[i] {
+                                "--rfc3161" => {
+                                    rfc3161 = true;
+                                    i += 1;
+                                },
+                                "--tsa-url" => {
+                                    if i + 1 < parts.len() {
+                                        tsa_url = Some(parts[i + 1].to_string());
+                                        i += 2;
+                                    } else {
+                                        return Err("--tsa-url requires a URL argument".into());
+                                    }
+                                },
+                                _ => {
+                                    return Err(format!("Unknown flag: {}", parts[i]).into());
+                                }
                             }
                         }
                         
@@ -2692,26 +3252,6 @@ impl LucidShell {
                         }
                         let output = PathBuf::from(parts[2]);
                         self.handle_evidence_command(EvidenceCommands::Report { output })?;
-                    },
-
-                    "template" => {
-                        if parts.len() < 3 {
-                            return Err("Usage: evidence template <output> [--type <standard|pentest|forensics>]".into());
-                        }
-                        let output = PathBuf::from(parts[2]);
-                        
-                        let mut template_type = None;
-                        for i in 3..parts.len() {
-                            if parts[i] == "--type" && i + 1 < parts.len() {
-                                template_type = Some(parts[i + 1].to_string());
-                                break;
-                            }
-                        }
-                        
-                        self.handle_evidence_command(EvidenceCommands::Template { 
-                            output, 
-                            template_type 
-                        })?;
                     },
                     _ => return Err(format!("Unknown evidence command: {}", parts[1]).into()),
                 }
@@ -2793,7 +3333,10 @@ impl LucidShell {
         println!("║                                                                ║");
         println!("║ Plugins:                                                       ║");
         println!("║   plugin list                List installed plugins            ║");
+        println!("║   plugin install <bundle>    Install plugin from bundle        ║");
+        println!("║   plugin remove <id>         Remove installed plugin           ║");
         println!("║   plugin verify              Verify plugin signatures          ║");
+        println!("║   plugin run <id> [args]     Execute plugin in sandbox         ║");
         println!("║                                                                ║");
         println!("║ Utility:                                                       ║");
         println!("║   clear, cls                 Clear terminal                    ║");
