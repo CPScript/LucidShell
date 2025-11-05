@@ -14,7 +14,7 @@ rustc -o devtools.exe src/main.rs
 ### **Install/UnInstall in LucidShell:**
 ```bash
 # Install
-lucidshell> plugin install devtools.exe
+lucidshell> plugin install plugins/devtools/devtools.exe
 
 # UnInstall
 lucidshell> plugin remove devtools
