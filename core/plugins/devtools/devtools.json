@@ -1,0 +1,212 @@
+{
+  "id": "devtools",
+  "name": "Development & Security Tools Plugin Bundle",
+  "version": "1.0.0",
+  "description": "Safe access to git, Python, Rust, and security tools with controlled network",
+  "capabilities": {
+    "network_access": true,
+    "filesystem_write": true,
+    "registry_access": false,
+    "description": "Controlled network access for development tools only. Bypasses Tor/VPN routing for legitimate development operations."
+  },
+  "tools": [
+    {
+      "name": "git",
+      "command": "git",
+      "description": "Version control - clone, pull, push, commit",
+      "requires_network": false,
+      "allowed_args": [
+        "clone",
+        "pull",
+        "push",
+        "fetch",
+        "commit",
+        "status",
+        "log",
+        "diff",
+        "branch",
+        "checkout",
+        "add",
+        "remote",
+        "merge",
+        "rebase",
+        "tag",
+        "stash"
+      ],
+      "restricted_args": []
+    },
+    {
+      "name": "python",
+      "command": "python",
+      "description": "Python interpreter and script execution",
+      "requires_network": false,
+      "allowed_args": [
+        "-c",
+        "-m",
+        "--version",
+        "-i",
+        "-u"
+      ],
+      "restricted_args": []
+    },
+    {
+      "name": "pip",
+      "command": "pip",
+      "description": "Python package manager",
+      "requires_network": true,
+      "allowed_args": [
+        "install",
+        "list",
+        "show",
+        "search",
+        "uninstall",
+        "freeze",
+        "check"
+      ],
+      "restricted_args": []
+    },
+    {
+      "name": "cargo",
+      "command": "cargo",
+      "description": "Rust package manager and build tool",
+      "requires_network": false,
+      "allowed_args": [
+        "build",
+        "run",
+        "test",
+        "doc",
+        "new",
+        "init",
+        "add",
+        "update",
+        "check",
+        "clean",
+        "search",
+        "install"
+      ],
+      "restricted_args": []
+    },
+    {
+      "name": "curl",
+      "command": "curl",
+      "description": "HTTP client for API testing",
+      "requires_network": true,
+      "allowed_args": [
+        "-X",
+        "-H",
+        "-d",
+        "--data",
+        "--header",
+        "-v",
+        "--verbose",
+        "-s",
+        "--silent",
+        "-o",
+        "--output"
+      ],
+      "restricted_args": []
+    },
+    {
+      "name": "node",
+      "command": "node",
+      "description": "Node.js JavaScript runtime",
+      "requires_network": false,
+      "allowed_args": [
+        "-e",
+        "--version",
+        "-p",
+        "--print"
+      ],
+      "restricted_args": []
+    },
+    {
+      "name": "npm",
+      "command": "npm",
+      "description": "Node package manager",
+      "requires_network": true,
+      "allowed_args": [
+        "install",
+        "update",
+        "list",
+        "run",
+        "start",
+        "test",
+        "build"
+      ],
+      "restricted_args": []
+    },
+    {
+      "name": "wget",
+      "command": "wget",
+      "description": "Network downloader",
+      "requires_network": true,
+      "allowed_args": [
+        "-O",
+        "--output-document",
+        "-q",
+        "--quiet"
+      ],
+      "restricted_args": []
+    },
+    {
+      "name": "ssh",
+      "command": "ssh",
+      "description": "Secure shell client",
+      "requires_network": true,
+      "allowed_args": [
+        "-p",
+        "-i",
+        "-l",
+        "-v"
+      ],
+      "restricted_args": []
+    },
+    {
+      "name": "docker",
+      "command": "docker",
+      "description": "Container management",
+      "requires_network": false,
+      "allowed_args": [
+        "ps",
+        "images",
+        "run",
+        "exec",
+        "stop",
+        "build",
+        "logs",
+        "inspect"
+      ],
+      "restricted_args": []
+    },
+    {
+      "name": "go",
+      "command": "go",
+      "description": "Go programming language tools",
+      "requires_network": false,
+      "allowed_args": [
+        "build",
+        "run",
+        "test",
+        "mod",
+        "get",
+        "install"
+      ],
+      "restricted_args": []
+    },
+    {
+      "name": "nmap",
+      "command": "nmap",
+      "description": "Network scanner (requires authorization)",
+      "requires_network": true,
+      "allowed_args": [
+        "-sT",
+        "-sS",
+        "-p",
+        "-A",
+        "-O",
+        "-v"
+      ],
+      "restricted_args": []
+    }
+  ]
+}
