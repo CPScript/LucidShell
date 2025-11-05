@@ -25,6 +25,7 @@ use std::os::windows::io::AsRawHandle;
 use winapi::shared::guiddef::GUID;
 #[cfg(target_os = "windows")]
 use winapi::shared::ntdef::PVOID;
+#[cfg(target_os = "windows")]
 
 #[derive(Parser)]
 #[command(name = "LucidShell")]
@@ -415,6 +416,13 @@ impl SandboxManager {
             use std::ffi::OsStr;
             use std::os::windows::ffi::OsStrExt;
             
+            if !Self::is_elevated() {
+                println!("  [WFP] Not running as administrator");
+                println!("  [WFP] Network blocking will NOT be enforced");
+                println!("  [WFP] Run as administrator for full security features");
+                return Ok(None);
+            }
+            
             let lib_name: Vec<u16> = OsStr::new("fwpuclnt.dll\0")
                 .encode_wide()
                 .collect();
@@ -449,12 +457,52 @@ impl SandboxManager {
             );
             
             if result == 0 && !engine_handle.is_null() {
-                println!("  [WFP] Firewall engine initialized");
+                println!("  [WFP] ✓ Firewall engine initialized successfully");
                 Ok(Some(engine_handle))
             } else {
                 println!("  [WFP] Failed to initialize firewall engine (code: 0x{:X})", result);
+                match result {
+                    0x5 => println!("  [WFP] ERROR_ACCESS_DENIED - Run as administrator"),
+                    0x32 => println!("  [WFP] ERROR_NOT_SUPPORTED - WFP service may not be running"),
+                    0x490 => println!("  [WFP] FWP_E_ALREADY_EXISTS - Session already exists"),
+                    _ => println!("  [WFP] Unknown error code"),
+                }
                 println!("  [WFP] Continuing without WFP support (requires admin rights)");
                 Ok(None)
+            }
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    fn is_elevated() -> bool {
+        use winapi::um::processthreadsapi::{GetCurrentProcess, OpenProcessToken};
+        use winapi::um::securitybaseapi::GetTokenInformation;
+        use winapi::um::winnt::{TokenElevation, TOKEN_QUERY, TOKEN_ELEVATION};
+        
+        unsafe {
+            let mut token: HANDLE = null_mut();
+            if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+                return false;
+            }
+            
+            let mut elevation: TOKEN_ELEVATION = std::mem::zeroed();
+            let mut size = std::mem::size_of::<TOKEN_ELEVATION>() as u32;
+            
+            let result = GetTokenInformation(
+                token,
+                TokenElevation,
+                &mut elevation as *mut _ as *mut _,
+                size,
+                &mut size,
+            );
+            
+            use winapi::um::handleapi::CloseHandle;
+            CloseHandle(token);
+            
+            if result != 0 {
+                elevation.TokenIsElevated != 0
+            } else {
+                false
             }
         }
     }
