@@ -1,0 +1,15 @@
+{
+  "devtools": {
+    "id": "devtools",
+    "name": "devtools",
+    "version": "1.0.0",
+    "signature": "a770588d71e9caf5c57d5aef88e3cf8b0e814e0260d5aafc324092b6a0cf6d8b",
+    "path": "plugins\\devtools.exe",
+    "capabilities": {
+      "network_access": false,
+      "filesystem_write": false,
+      "registry_access": false,
+      "description": "A Lucidshell plugin"
+    }
+  }
+}
