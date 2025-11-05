@@ -1,4 +1,4 @@
-# LucidShell - White-Hat Security Shell
+# LucidShell - White-Hat Security Shell (not optimized)
 
 ## Implementation Plan
 
