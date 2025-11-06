@@ -1,7 +1,7 @@
 [package]
 name = "lucidshell-devtools"
 version = "1.0.0"
-edition = "2025"
+edition = "2021"
 authors = ["CPScript"]
 description = "Development tools plugin for LucidShell with controlled network access"
 
