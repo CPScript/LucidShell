@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::io::{self, Write, BufRead, BufReader, Read};
+use std::io::{self, Write, Read};
 use std::sync::{Arc, Mutex};
 use std::path::{Path, PathBuf};
 use std::fs::{File, OpenOptions};
@@ -19,8 +19,6 @@ use winapi::um::winnt::{HANDLE, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE};
 use winapi::um::handleapi::CloseHandle;
 #[cfg(target_os = "windows")]
 use std::ptr::null_mut;
-#[cfg(target_os = "windows")]
-use std::os::windows::io::AsRawHandle;
 #[cfg(target_os = "windows")]
 use winapi::shared::guiddef::GUID;
 #[cfg(target_os = "windows")]
@@ -507,43 +505,108 @@ impl SandboxManager {
         }
     }
     
+    #[cfg(target_os = "windows")]
     fn apply_filesystem_restrictions(&self, process_id: u32, access: &FilesystemAccess) -> Result<(), Box<dyn std::error::Error>> {
-        #[cfg(target_os = "windows")]
-        {
-            use winapi::um::processthreadsapi::OpenProcess;
-            use winapi::um::winnt::{PROCESS_SET_INFORMATION, TOKEN_ASSIGN_PRIMARY, TOKEN_ADJUST_PRIVILEGES};
-            use winapi::um::processthreadsapi::OpenProcessToken;
-            
-            unsafe {
-                let process_handle = OpenProcess(PROCESS_SET_INFORMATION, 0, process_id);
-                if process_handle.is_null() {
-                    return Err("Failed to open process for restrictions".into());
-                }
-                
-                let mut token_handle: HANDLE = null_mut();
-                let result = OpenProcessToken(
-                    process_handle,
-                    TOKEN_ADJUST_PRIVILEGES | TOKEN_ASSIGN_PRIMARY,
-                    &mut token_handle
-                );
-                
-                if result != 0 && !token_handle.is_null() {
-                    let integrity_level: u32 = match access {
-                        FilesystemAccess::None => 0x1000,
-                        FilesystemAccess::ReadOnly => 0x2000,
-                        FilesystemAccess::ReadWrite => 0x3000,
-                    };
-                    
-                    println!("  [Sandbox] Applied integrity level: 0x{:X}", integrity_level);
-                    
-                    CloseHandle(token_handle);
-                }
-                
-                CloseHandle(process_handle);
-            }
-        }
+        use winapi::um::processthreadsapi::{OpenProcess, OpenProcessToken};
+        use winapi::um::winnt::{PROCESS_ALL_ACCESS, TOKEN_ALL_ACCESS, TOKEN_MANDATORY_LABEL};
+        use winapi::um::securitybaseapi::SetTokenInformation;
+        use winapi::um::winnt::{TokenIntegrityLevel, SE_GROUP_INTEGRITY};
+        use winapi::um::winnt::PSID;
+        use winapi::um::winbase::LocalAlloc;
+        use winapi::um::minwinbase::LPTR;
+        use winapi::shared::sddl::ConvertStringSidToSidW;
+        use std::ffi::OsStr;
+        use std::os::windows::ffi::OsStrExt;
         
-        Ok(())
+        unsafe {
+            let process_handle = OpenProcess(PROCESS_ALL_ACCESS, 0, process_id);
+            if process_handle.is_null() {
+                return Err("Failed to open process for restrictions".into());
+            }
+            
+            let mut token_handle: HANDLE = null_mut();
+            let result = OpenProcessToken(
+                process_handle,
+                TOKEN_ALL_ACCESS,
+                &mut token_handle
+            );
+            
+            if result == 0 || token_handle.is_null() {
+                CloseHandle(process_handle);
+                return Err("Failed to open process token".into());
+            }
+            
+            let integrity_sid_string = match access {
+                FilesystemAccess::None => "S-1-16-0",
+                FilesystemAccess::ReadOnly => "S-1-16-4096",
+                FilesystemAccess::ReadWrite => "S-1-16-8192",
+            };
+            
+            println!("  [Sandbox] Setting integrity level: {:?} ({})", 
+                match access {
+                    FilesystemAccess::None => "Untrusted",
+                    FilesystemAccess::ReadOnly => "Low",
+                    FilesystemAccess::ReadWrite => "Medium",
+                },
+                integrity_sid_string
+            );
+            
+            let sid_string_wide: Vec<u16> = OsStr::new(integrity_sid_string)
+                .encode_wide()
+                .chain(Some(0))
+                .collect();
+            
+            let mut sid_ptr: PSID = null_mut();
+            let convert_result = ConvertStringSidToSidW(
+                sid_string_wide.as_ptr(),
+                &mut sid_ptr
+            );
+            
+            if convert_result == 0 || sid_ptr.is_null() {
+                CloseHandle(token_handle);
+                CloseHandle(process_handle);
+                return Err("Failed to convert SID string".into());
+            }
+            
+            use winapi::um::securitybaseapi::GetLengthSid;
+            let sid_length = GetLengthSid(sid_ptr);
+            
+            let tml_size = std::mem::size_of::<TOKEN_MANDATORY_LABEL>() + sid_length as usize;
+            let tml_ptr = LocalAlloc(LPTR, tml_size) as *mut TOKEN_MANDATORY_LABEL;
+            
+            if tml_ptr.is_null() {
+                use winapi::um::winbase::LocalFree;
+                LocalFree(sid_ptr as *mut _);
+                CloseHandle(token_handle);
+                CloseHandle(process_handle);
+                return Err("Failed to allocate memory for TOKEN_MANDATORY_LABEL".into());
+            }
+            
+            (*tml_ptr).Label.Sid = sid_ptr;
+            (*tml_ptr).Label.Attributes = SE_GROUP_INTEGRITY;
+            
+            let set_result = SetTokenInformation(
+                token_handle,
+                TokenIntegrityLevel,
+                tml_ptr as *mut _,
+                tml_size as u32,
+            );
+            
+            use winapi::um::winbase::LocalFree;
+            LocalFree(tml_ptr as *mut _);
+            LocalFree(sid_ptr as *mut _);
+            CloseHandle(token_handle);
+            CloseHandle(process_handle);
+            
+            if set_result == 0 {
+                let error = winapi::um::errhandlingapi::GetLastError();
+                return Err(format!("Failed to set integrity level (error: 0x{:X})", error).into());
+            }
+            
+            println!("  [Sandbox] ✓ Integrity level applied successfully");
+            
+            Ok(())
+        }
     }
     
     fn apply_network_restrictions(&mut self, process_id: u32, network_allowed: bool) -> Result<(), Box<dyn std::error::Error>> {
@@ -770,119 +833,267 @@ impl SandboxManager {
         }
     }
     
-    fn execute_sandboxed(
-        &mut self,
-        tool: &str,
-        args: &[String],
-        config: SandboxConfig,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        println!("  [Sandbox] Profile: {}", config.profile);
-        println!("  [Sandbox] Network: {}", config.network_allowed);
-        println!("  [Sandbox] Filesystem: {:?}", match config.filesystem_access {
-            FilesystemAccess::ReadOnly => "ReadOnly",
-            FilesystemAccess::ReadWrite => "ReadWrite",
-            FilesystemAccess::None => "None",
-        });
+#[cfg(target_os = "windows")]
+fn execute_sandboxed(
+    &mut self,
+    tool: &str,
+    args: &[String],
+    config: SandboxConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
+    println!("  [Sandbox] Profile: {}", config.profile);
+    println!("  [Sandbox] Network: {}", config.network_allowed);
+    println!("  [Sandbox] Filesystem: {:?}", match config.filesystem_access {
+        FilesystemAccess::ReadOnly => "ReadOnly",
+        FilesystemAccess::ReadWrite => "ReadWrite",
+        FilesystemAccess::None => "None",
+    });
+    
+    let tool_path = self.resolve_tool_path(tool)?;
+    
+    self.execute_with_restrictions(&tool_path, args, &config)?;
+    
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn execute_with_restrictions(
+    &mut self,
+    tool_path: &Path,
+    args: &[String],
+    config: &SandboxConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use winapi::um::securitybaseapi::{DuplicateTokenEx, SetTokenInformation, GetLengthSid};
+    use winapi::um::processthreadsapi::{
+        PROCESS_INFORMATION, STARTUPINFOW,
+        OpenProcessToken, GetExitCodeProcess
+    };
+    use winapi::um::processenv::GetStdHandle;
+    use winapi::um::winnt::{
+        TOKEN_ALL_ACCESS, SecurityImpersonation, TokenPrimary,
+        TOKEN_MANDATORY_LABEL, TokenIntegrityLevel
+    };
+    use winapi::um::synchapi::WaitForSingleObject;
+    use winapi::um::minwinbase::LPTR;
+    use winapi::um::winbase::{LocalAlloc, LocalFree, INFINITE, STD_INPUT_HANDLE};
+    use winapi::shared::sddl::ConvertStringSidToSidW;
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
+    use std::ptr::null_mut;
+    use std::mem;
+    
+    unsafe {
+        let current_process = winapi::um::processthreadsapi::GetCurrentProcess();
+        let mut current_token: HANDLE = null_mut();
         
-        let tool_path = self.resolve_tool_path(tool)?;
-        
-        let mut cmd = Command::new(&tool_path);
-        cmd.args(args);
-        cmd.stdin(Stdio::inherit());
-        cmd.stdout(Stdio::piped());
-        cmd.stderr(Stdio::piped());
-        
-        #[cfg(target_os = "windows")]
-        {
-            use std::os::windows::process::CommandExt;
-            const CREATE_SUSPENDED: u32 = 0x00000004;
-            const CREATE_NO_WINDOW: u32 = 0x08000000;
-            
-            cmd.creation_flags(CREATE_SUSPENDED | CREATE_NO_WINDOW);
+        if OpenProcessToken(current_process, TOKEN_ALL_ACCESS, &mut current_token) == 0 {
+            return Err("Failed to open current process token".into());
         }
         
-        let mut child = cmd.spawn()?;
-        let process_id = child.id();
+        let mut restricted_token: HANDLE = null_mut();
+        let dup_result = DuplicateTokenEx(
+            current_token,
+            TOKEN_ALL_ACCESS,
+            null_mut(),
+            SecurityImpersonation,
+            TokenPrimary,
+            &mut restricted_token,
+        );
+        
+        CloseHandle(current_token);
+        
+        if dup_result == 0 || restricted_token.is_null() {
+            return Err("Failed to duplicate token".into());
+        }
+        
+        let integrity_sid_string = match config.filesystem_access {
+            FilesystemAccess::None => "S-1-16-0\0",      // Untrusted (0x0000)
+            FilesystemAccess::ReadOnly => "S-1-16-4096\0", // Low (0x1000)
+            FilesystemAccess::ReadWrite => "S-1-16-8192\0", // Medium (0x2000)
+        };
+        
+        println!("  [Sandbox] Setting integrity: {:?}", match config.filesystem_access {
+            FilesystemAccess::None => "Untrusted (S-1-16-0) - No write access anywhere",
+            FilesystemAccess::ReadOnly => "Low (S-1-16-4096) - Limited write access",
+            FilesystemAccess::ReadWrite => "Medium (S-1-16-8192) - Normal write access",
+        });
+        
+        let sid_wide: Vec<u16> = OsStr::new(integrity_sid_string)
+            .encode_wide()
+            .collect();
+        
+        let mut sid_ptr = null_mut();
+        if ConvertStringSidToSidW(sid_wide.as_ptr(), &mut sid_ptr) == 0 {
+            CloseHandle(restricted_token);
+            return Err("Failed to convert SID".into());
+        }
+        
+        use winapi::um::winnt::SE_GROUP_INTEGRITY;
+        
+        let sid_length = GetLengthSid(sid_ptr);
+        let tml_size = mem::size_of::<TOKEN_MANDATORY_LABEL>() + sid_length as usize;
+        let tml_ptr = LocalAlloc(LPTR, tml_size) as *mut TOKEN_MANDATORY_LABEL;
+        
+        if tml_ptr.is_null() {
+            LocalFree(sid_ptr as *mut _);
+            CloseHandle(restricted_token);
+            return Err("Failed to allocate memory".into());
+        }
+        
+        (*tml_ptr).Label.Sid = sid_ptr;
+        (*tml_ptr).Label.Attributes = SE_GROUP_INTEGRITY;
+        
+        let set_result = SetTokenInformation(
+            restricted_token,
+            TokenIntegrityLevel,
+            tml_ptr as *mut _,
+            tml_size as u32,
+        );
+        
+        LocalFree(tml_ptr as *mut _);
+        LocalFree(sid_ptr as *mut _);
+        
+        if set_result == 0 {
+            let error = winapi::um::errhandlingapi::GetLastError();
+            CloseHandle(restricted_token);
+            return Err(format!("Failed to set token integrity (error: 0x{:X})", error).into());
+        }
+        
+        println!("  [Sandbox] ✓ Token integrity level configured");
+        
+        let mut cmd_line = format!("\"{}\"", tool_path.display());
+        for arg in args {
+            cmd_line.push_str(&format!(" \"{}\"", arg));
+        }
+        let mut cmd_line_wide: Vec<u16> = OsStr::new(&cmd_line)
+            .encode_wide()
+            .chain(Some(0))
+            .collect();
+        
+        let mut startup_info: STARTUPINFOW = mem::zeroed();
+        startup_info.cb = mem::size_of::<STARTUPINFOW>() as u32;
+        
+        let mut process_info: PROCESS_INFORMATION = mem::zeroed();
+        
+        use winapi::um::namedpipeapi::CreatePipe;
+        use winapi::um::handleapi::SetHandleInformation;
+        use winapi::um::winbase::{HANDLE_FLAG_INHERIT, STARTF_USESTDHANDLES};
+        use winapi::shared::minwindef::TRUE;
+
+        let mut stdout_read: HANDLE = null_mut();
+        let mut stdout_write: HANDLE = null_mut();
+
+        let mut sa: winapi::um::minwinbase::SECURITY_ATTRIBUTES = mem::zeroed();
+        sa.nLength = mem::size_of::<winapi::um::minwinbase::SECURITY_ATTRIBUTES>() as u32;
+        sa.bInheritHandle = TRUE;
+
+        CreatePipe(&mut stdout_read, &mut stdout_write, &mut sa, 0);
+        SetHandleInformation(stdout_read, HANDLE_FLAG_INHERIT, 0);
+
+        startup_info.dwFlags = STARTF_USESTDHANDLES;
+        startup_info.hStdOutput = stdout_write;
+        startup_info.hStdError = stdout_write;
+        startup_info.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+
+        use winapi::um::processthreadsapi::CreateProcessAsUserW;
+        
+        let create_result = CreateProcessAsUserW(
+            restricted_token,
+            null_mut(),
+            cmd_line_wide.as_mut_ptr(),
+            null_mut(),
+            null_mut(),
+            0,
+            winapi::um::winbase::CREATE_NO_WINDOW,
+            null_mut(),
+            null_mut(),
+            &mut startup_info,
+            &mut process_info,
+        );
+        
+        CloseHandle(restricted_token);
+        
+        if create_result == 0 {
+            let error = winapi::um::errhandlingapi::GetLastError();
+            return Err(format!("CreateProcessAsUserW failed (error: 0x{:X})", error).into());
+        }
+        
+        let process_id = process_info.dwProcessId;
+        let process_handle = process_info.hProcess;
+        let thread_handle = process_info.hThread;
+        
+        println!("  [Sandbox] ✓ Process created with restricted token (PID: {})", process_id);
         
         self.active_processes.push(process_id);
         
-        #[cfg(target_os = "windows")]
-        {
-            if let Some(job_handle) = self.job_handle {
-                unsafe {
-                    let process_handle = child.as_raw_handle() as HANDLE;
-                    
-                    let result = AssignProcessToJobObject(job_handle, process_handle);
-                    if result == 0 {
-                        child.kill()?;
-                        return Err("Failed to assign process to job object".into());
-                    }
-                    
-                    self.apply_filesystem_restrictions(process_id, &config.filesystem_access)?;
-                    self.apply_network_restrictions(process_id, config.network_allowed)?;
-                    
-                    use winapi::um::processthreadsapi::ResumeThread;
-                    use winapi::um::tlhelp32::{CreateToolhelp32Snapshot, Thread32First, Thread32Next, THREADENTRY32, TH32CS_SNAPTHREAD};
-                    
-                    let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
-                    if !snapshot.is_null() {
-                        let mut te: THREADENTRY32 = std::mem::zeroed();
-                        te.dwSize = std::mem::size_of::<THREADENTRY32>() as u32;
-                        
-                        if Thread32First(snapshot, &mut te) != 0 {
-                            loop {
-                                if te.th32OwnerProcessID == process_id {
-                                    use winapi::um::processthreadsapi::OpenThread;
-                                    use winapi::um::winnt::THREAD_SUSPEND_RESUME;
-                                    
-                                    let thread_handle = OpenThread(THREAD_SUSPEND_RESUME, 0, te.th32ThreadID);
-                                    if !thread_handle.is_null() {
-                                        ResumeThread(thread_handle);
-                                        CloseHandle(thread_handle);
-                                    }
-                                }
-                                
-                                if Thread32Next(snapshot, &mut te) == 0 {
-                                    break;
-                                }
-                            }
-                        }
-                        CloseHandle(snapshot);
-                    }
-                }
+        if let Some(job_handle) = self.job_handle {
+            if AssignProcessToJobObject(job_handle, process_handle) == 0 {
+                use winapi::um::processthreadsapi::TerminateProcess;
+                TerminateProcess(process_handle, 1);
+                CloseHandle(process_handle);
+                CloseHandle(thread_handle);
+                return Err("Failed to assign to job object".into());
             }
+            println!("  [Sandbox] ✓ Process assigned to job object");
         }
         
-        let stdout_handle = child.stdout.take();
-        let stderr_handle = child.stderr.take();
+        self.apply_network_restrictions(process_id, config.network_allowed)?;
         
-        if let Some(stdout) = stdout_handle {
-            let reader = BufReader::new(stdout);
-            for line in reader.lines() {
-                if let Ok(line) = line {
-                    println!("{}", line);
-                }
-            }
-        }
+        CloseHandle(thread_handle);
         
-        if let Some(stderr) = stderr_handle {
-            let reader = BufReader::new(stderr);
-            for line in reader.lines() {
-                if let Ok(line) = line {
-                    eprintln!("{}", line);
-                }
-            }
-        }
+        println!("  [Sandbox] Waiting for process to complete...");
         
-        let status = child.wait()?;
+        WaitForSingleObject(process_handle, INFINITE);
+        
+        let mut exit_code: u32 = 0;
+        GetExitCodeProcess(process_handle, &mut exit_code);
+        
+        CloseHandle(process_handle);
         
         self.active_processes.retain(|&pid| pid != process_id);
         
-        if !status.success() {
-            return Err(format!("Tool exited with status: {}", status).into());
+        if exit_code != 0 {
+            println!("  [Sandbox] Process exited with code: {}", exit_code);
+        } else {
+            println!("  [Sandbox] ✓ Process completed successfully");
         }
         
         Ok(())
+    }
+}
+
+    #[cfg(target_os = "windows")]
+    #[allow(dead_code)]
+    fn create_child_from_handle(
+        _process_handle: HANDLE,
+        _process_id: u32,
+        stdout_handle: HANDLE,
+        stderr_handle: HANDLE,
+    ) -> Result<std::process::Child, Box<dyn std::error::Error>> {
+        use std::os::windows::io::FromRawHandle;
+        use std::fs::File;
+        
+        unsafe {
+            let _stdout = File::from_raw_handle(stdout_handle as *mut _);
+            let _stderr = File::from_raw_handle(stderr_handle as *mut _);
+            // This is a workaround, we can't directly create a Child. We use Command but immediately replace the internals
+            let mut dummy_cmd = Command::new("cmd.exe");
+            dummy_cmd.stdout(Stdio::piped());
+            dummy_cmd.stderr(Stdio::piped());
+            dummy_cmd.stdin(Stdio::null());
+            
+            use std::os::windows::process::CommandExt; // We need to spawn it suspended and then terminate it. Necessary to get a Child struct
+            dummy_cmd.creation_flags(winapi::um::winbase::CREATE_SUSPENDED | winapi::um::winbase::CREATE_NO_WINDOW);
+            
+            let mut child = dummy_cmd.spawn()?;
+            
+            child.kill()?;
+            child.wait()?;
+            
+            let stdout = File::from_raw_handle(stdout_handle as *mut _);
+            let stderr = File::from_raw_handle(stderr_handle as *mut _);
+
+            Err("Manual handle management required - see simplified approach below".into())
+        }
     }
     
     fn resolve_tool_path(&self, tool: &str) -> Result<PathBuf, Box<dyn std::error::Error>> {
@@ -894,6 +1105,9 @@ impl SandboxManager {
             ("tracert", "C:\\Windows\\System32\\tracert.exe"),
             ("whoami", "C:\\Windows\\System32\\whoami.exe"),
             ("systeminfo", "C:\\Windows\\System32\\systeminfo.exe"),
+            ("cmd", "C:\\Windows\\System32\\cmd.exe"),
+            ("powershell", "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe"),
+            ("notepad", "C:\\Windows\\System32\\notepad.exe"),
         ];
         
         for (name, path) in &builtin_tools {
@@ -1586,7 +1800,7 @@ impl NetworkManager {
                     self.status = NetworkStatus::Tor { port: *port, verified: false };
                     self.kill_switch_active = true;
                     println!("  [Network] ✗ Tor verification failed");
-                    println!("  [Network] ⚠ KILL SWITCH ACTIVATED - ALL NETWORK ACCESS BLOCKED");
+                    println!("  [Network] KILL SWITCH ACTIVATED - ALL NETWORK ACCESS BLOCKED");
                     return Err("Tor connection lost - kill switch activated".into());
                 }
             },
@@ -3085,7 +3299,7 @@ impl LucidShell {
     }
     
     fn panic_wipe(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        println!("\n⚠ PANIC WIPE INITIATED");
+        println!("\nPANIC WIPE INITIATED");
         
         let mut logger = self.log_writer.lock().unwrap();
         let _ = logger.log_event("PANIC_WIPE", "emergency_termination", &self.crypto_engine);
@@ -3173,16 +3387,36 @@ impl LucidShell {
             },
             "run" => {
                 if parts.len() < 2 {
-                    return Err("Usage: run <tool> [--network] [args...]".into());
+                    return Err("Usage: run <tool> [--network] [--profile <profile>] [args...]".into());
                 }
                 let tool = parts[1].to_string();
                 let network = parts.contains(&"--network");
+                
+                let mut profile = None;
+                let mut skip_next = false;
+                for i in 2..parts.len() {
+                    if skip_next {
+                        skip_next = false;
+                        continue;
+                    }
+                    if parts[i] == "--profile" && i + 1 < parts.len() {
+                        profile = Some(parts[i + 1].to_string());
+                        skip_next = true;
+                    }
+                }
+                
                 let args: Vec<String> = parts[2..]
                     .iter()
-                    .filter(|&&s| s != "--network")
-                    .map(|s| s.to_string())
+                    .enumerate()
+                    .filter(|(i, &s)| {
+                        s != "--network" && 
+                        s != "--profile" && 
+                        (i == &0 || parts[i + 1] != "--profile")
+                    })
+                    .map(|(_, s)| s.to_string())
                     .collect();
-                self.run_tool(tool, network, None, args)?;
+                
+                self.run_tool(tool, network, profile, args)?;
             },
             "network" => {
                 if parts.len() < 2 {
