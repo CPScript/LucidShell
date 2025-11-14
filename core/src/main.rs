@@ -1,3 +1,8 @@
+// LucidShell ~ A hand written high-performance, memory-safe, sandboxed Windows security shell built in Rust for authorized penetration testing and forensics. 
+// NOTE ~ Copilet was used to generate print statments.
+
+// If you like what i have made, please star this repository -> https://github.com/CPScript/LucidShell
+
 use std::collections::HashMap;
 use std::io::{self, Write, Read};
 use std::sync::{Arc, Mutex};
@@ -832,7 +837,7 @@ impl SandboxManager {
             }
         }
     }
-    
+
 #[cfg(target_os = "windows")]
 fn execute_sandboxed(
     &mut self,
@@ -850,6 +855,7 @@ fn execute_sandboxed(
     
     let tool_path = self.resolve_tool_path(tool)?;
     
+    // Use manual process creation with full sandboxing
     self.execute_with_restrictions(&tool_path, args, &config)?;
     
     Ok(())
@@ -862,26 +868,27 @@ fn execute_with_restrictions(
     args: &[String],
     config: &SandboxConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use winapi::um::securitybaseapi::{DuplicateTokenEx, SetTokenInformation, GetLengthSid};
     use winapi::um::processthreadsapi::{
         PROCESS_INFORMATION, STARTUPINFOW,
-        OpenProcessToken, GetExitCodeProcess
+        OpenProcessToken, GetExitCodeProcess,
     };
-    use winapi::um::processenv::GetStdHandle;
+    use winapi::um::securitybaseapi::{SetTokenInformation, GetLengthSid, DuplicateTokenEx};
     use winapi::um::winnt::{
         TOKEN_ALL_ACCESS, SecurityImpersonation, TokenPrimary,
         TOKEN_MANDATORY_LABEL, TokenIntegrityLevel
     };
     use winapi::um::synchapi::WaitForSingleObject;
+    use winapi::um::winbase::{LocalAlloc, LocalFree};
     use winapi::um::minwinbase::LPTR;
-    use winapi::um::winbase::{LocalAlloc, LocalFree, INFINITE, STD_INPUT_HANDLE};
-    use winapi::shared::sddl::ConvertStringSidToSidW;
+    use winapi::um::processenv::GetStdHandle;
+    use winapi::shared::winerror::WAIT_TIMEOUT;
     use std::ffi::OsStr;
     use std::os::windows::ffi::OsStrExt;
     use std::ptr::null_mut;
     use std::mem;
     
     unsafe {
+        // Get current process token
         let current_process = winapi::um::processthreadsapi::GetCurrentProcess();
         let mut current_token: HANDLE = null_mut();
         
@@ -889,6 +896,7 @@ fn execute_with_restrictions(
             return Err("Failed to open current process token".into());
         }
         
+        // Duplicate token so we can modify it
         let mut restricted_token: HANDLE = null_mut();
         let dup_result = DuplicateTokenEx(
             current_token,
@@ -905,6 +913,7 @@ fn execute_with_restrictions(
             return Err("Failed to duplicate token".into());
         }
         
+        // Set integrity level on the duplicated token BEFORE creating process
         let integrity_sid_string = match config.filesystem_access {
             FilesystemAccess::None => "S-1-16-0\0",      // Untrusted (0x0000)
             FilesystemAccess::ReadOnly => "S-1-16-4096\0", // Low (0x1000)
@@ -917,6 +926,7 @@ fn execute_with_restrictions(
             FilesystemAccess::ReadWrite => "Medium (S-1-16-8192) - Normal write access",
         });
         
+        use winapi::shared::sddl::ConvertStringSidToSidW;
         let sid_wide: Vec<u16> = OsStr::new(integrity_sid_string)
             .encode_wide()
             .collect();
@@ -960,6 +970,7 @@ fn execute_with_restrictions(
         
         println!("  [Sandbox] ✓ Token integrity level configured");
         
+        // Build command line
         let mut cmd_line = format!("\"{}\"", tool_path.display());
         for arg in args {
             cmd_line.push_str(&format!(" \"{}\"", arg));
@@ -969,11 +980,10 @@ fn execute_with_restrictions(
             .chain(Some(0))
             .collect();
         
+        // Setup STARTUPINFO for output capture
         let mut startup_info: STARTUPINFOW = mem::zeroed();
         startup_info.cb = mem::size_of::<STARTUPINFOW>() as u32;
-        
-        let mut process_info: PROCESS_INFORMATION = mem::zeroed();
-        
+
         use winapi::um::namedpipeapi::CreatePipe;
         use winapi::um::handleapi::SetHandleInformation;
         use winapi::um::winbase::{HANDLE_FLAG_INHERIT, STARTF_USESTDHANDLES};
@@ -992,8 +1002,13 @@ fn execute_with_restrictions(
         startup_info.dwFlags = STARTF_USESTDHANDLES;
         startup_info.hStdOutput = stdout_write;
         startup_info.hStdError = stdout_write;
-        startup_info.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
-
+        startup_info.hStdInput = GetStdHandle(
+            winapi::um::winbase::STD_INPUT_HANDLE
+        );
+        
+        let mut process_info: PROCESS_INFORMATION = mem::zeroed();
+        
+        // Create process with restricted token
         use winapi::um::processthreadsapi::CreateProcessAsUserW;
         
         let create_result = CreateProcessAsUserW(
@@ -1002,7 +1017,7 @@ fn execute_with_restrictions(
             cmd_line_wide.as_mut_ptr(),
             null_mut(),
             null_mut(),
-            0,
+            TRUE, // Don't inherit handles
             winapi::um::winbase::CREATE_NO_WINDOW,
             null_mut(),
             null_mut(),
@@ -1011,8 +1026,10 @@ fn execute_with_restrictions(
         );
         
         CloseHandle(restricted_token);
+        CloseHandle(stdout_write);
         
         if create_result == 0 {
+            CloseHandle(stdout_read);
             let error = winapi::um::errhandlingapi::GetLastError();
             return Err(format!("CreateProcessAsUserW failed (error: 0x{:X})", error).into());
         }
@@ -1025,6 +1042,7 @@ fn execute_with_restrictions(
         
         self.active_processes.push(process_id);
         
+        // Assign to job object for additional containment
         if let Some(job_handle) = self.job_handle {
             if AssignProcessToJobObject(job_handle, process_handle) == 0 {
                 use winapi::um::processthreadsapi::TerminateProcess;
@@ -1036,14 +1054,67 @@ fn execute_with_restrictions(
             println!("  [Sandbox] ✓ Process assigned to job object");
         }
         
+        // Apply network restrictions
         self.apply_network_restrictions(process_id, config.network_allowed)?;
         
+        // Close thread handle (we don't need it)
         CloseHandle(thread_handle);
+
+        println!("  [Sandbox] Process running (PID: {})...", process_id);
+
+        // Read output while process is running
+        use std::os::windows::io::FromRawHandle;
+        use std::io::{BufRead, BufReader};
+        use winapi::um::synchapi::WaitForSingleObject;
+        use winapi::shared::winerror::WAIT_TIMEOUT;
+
+        let stdout_file = std::fs::File::from_raw_handle(stdout_read as *mut _);
+        let mut reader = BufReader::new(stdout_file);
+        let mut line = String::new();
+
+        loop {
+            // Check if process is still running (100ms timeout)
+            let wait_result = WaitForSingleObject(process_handle, 100);
+            
+            // Try to read available output
+            match reader.read_line(&mut line) {
+                Ok(0) => {
+                    // No more data available
+                    if wait_result != WAIT_TIMEOUT {
+                        // Process has exited and no more data
+                        break;
+                    }
+                },
+                Ok(_) => {
+                    // Got a line, print it
+                    print!("{}", line);
+                    line.clear();
+                },
+                Err(_) => {
+                    // Read error, check if process exited
+                    if wait_result != WAIT_TIMEOUT {
+                        break;
+                    }
+                }
+            }
+            
+            // Break if process exited
+            if wait_result != WAIT_TIMEOUT {
+                // Read any remaining output
+                loop {
+                    line.clear();
+                    match reader.read_line(&mut line) {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => print!("{}", line),
+                    }
+                }
+                break;
+            }
+        }
+
+        println!("  [Sandbox] Process completed");
         
-        println!("  [Sandbox] Waiting for process to complete...");
-        
-        WaitForSingleObject(process_handle, INFINITE);
-        
+        // Get exit code
         let mut exit_code: u32 = 0;
         GetExitCodeProcess(process_handle, &mut exit_code);
         
@@ -1052,7 +1123,7 @@ fn execute_with_restrictions(
         self.active_processes.retain(|&pid| pid != process_id);
         
         if exit_code != 0 {
-            println!("  [Sandbox] Process exited with code: {}", exit_code);
+            println!("  [Sandbox] ⚠ Process exited with code: {}", exit_code);
         } else {
             println!("  [Sandbox] ✓ Process completed successfully");
         }
@@ -3393,27 +3464,29 @@ impl LucidShell {
                 let network = parts.contains(&"--network");
                 
                 let mut profile = None;
-                let mut skip_next = false;
-                for i in 2..parts.len() {
-                    if skip_next {
-                        skip_next = false;
+                let mut args_start_idx = 2;
+                
+                // Parse flags
+                let mut i = 2;
+                while i < parts.len() {
+                    if parts[i] == "--network" {
+                        i += 1;
                         continue;
                     }
                     if parts[i] == "--profile" && i + 1 < parts.len() {
                         profile = Some(parts[i + 1].to_string());
-                        skip_next = true;
+                        i += 2;
+                        continue;
                     }
+                    // First non-flag argument
+                    args_start_idx = i;
+                    break;
                 }
                 
-                let args: Vec<String> = parts[2..]
+                // Collect all remaining arguments as-is
+                let args: Vec<String> = parts[args_start_idx..]
                     .iter()
-                    .enumerate()
-                    .filter(|(i, &s)| {
-                        s != "--network" && 
-                        s != "--profile" && 
-                        (i == &0 || parts[i + 1] != "--profile")
-                    })
-                    .map(|(_, s)| s.to_string())
+                    .map(|s| s.to_string())
                     .collect();
                 
                 self.run_tool(tool, network, profile, args)?;
