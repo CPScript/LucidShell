@@ -1,7 +1,7 @@
-# LucidShell - White-Hat Security Shell (not optimized)
+# LucidShell - White-Hat Security Shell
 
 ### About; 
-> This is a **sophisticated white-hat security framework** with exceptional attention to legal compliance and evidence handling. The cryptographic logging, chain-of-custody, and engagement letter system make it suitable for professional security work where legal defensibility matters. This is ment for Windows-based security operations.
+> This is a **white-hat security framework** with exceptional attention to legal compliance and evidence handling. The cryptographic logging, chain-of-custody, and engagement letter system make it suitable for professional security work where legal defensibility matters. This is ment for Windows-based security operations.
 
 Y/N | Use Cases
 ---|---
